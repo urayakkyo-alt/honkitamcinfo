@@ -1,0 +1,280 @@
+<!--
+Minecraft サーバー情報サイト - single-file HTML
+説明:
+ - サーバーIPを入力してステータスを自動取得（mcsrvstat API を使用）
+ - プレイヤー数、バージョン、モッド有無、ホワイトリスト情報を表示
+ - ニュース、ルール、接続方法、管理者連絡先を含む
+ - レスポンシブ・モバイル対応。コピー&ペーストでそのまま使える。
+
+使い方:
+ 1) このファイルを保存 (minecraft-server-info-site.html)
+ 2) 実際のサーバーIPを入力して "チェック" ボタンを押す
+ 3) 必要なら footer の管理者情報やサイト文言を編集してください
+
+注意:
+ - API に依存するため、ブラウザの CORS 制限や API の可用性により動作しない場合があります。
+ - mcsrvstat は無料の公開 API の一つです。企業向けや高トラフィック用途では自前のステータスプローブを推奨します。
+-->
+
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>サーバー名 - Minecraft サーバー情報</title>
+  <style>
+    :root{--bg:#0f1724;--card:#0b1220;--accent:#10b981;--muted:#9aa4b2;--glass: rgba(255,255,255,0.03)}
+    *{box-sizing:border-box}
+    body{margin:0;font-family:Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; background:linear-gradient(180deg,#071022 0%, #081226 60%);color:#e6eef6;min-height:100vh}
+    .container{max-width:1100px;margin:28px auto;padding:16px}
+    header{display:flex;gap:12px;align-items:center;margin-bottom:18px}
+    .logo{width:64px;height:64px;background:var(--glass);display:flex;align-items:center;justify-content:center;border-radius:12px}
+    .title{line-height:1}
+    h1{font-size:20px;margin:0}
+    p.lead{margin:2px 0 0;color:var(--muted);font-size:13px}
+
+    .grid{display:grid;grid-template-columns:1fr 360px;gap:16px}
+    @media(max-width:900px){.grid{grid-template-columns:1fr}}
+
+    .card{background:linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.007));padding:16px;border-radius:12px;box-shadow:0 6px 18px rgba(2,6,23,0.6);}
+    .card h2{margin:0 0 10px 0}
+    label{display:block;font-size:13px;color:var(--muted);margin-bottom:6px}
+    input[type=text]{width:100%;padding:10px;border-radius:8px;border:1px solid rgba(255,255,255,0.04);background:transparent;color:inherit}
+    button{background:var(--accent);border:none;padding:10px 12px;border-radius:8px;color:#072018;cursor:pointer;font-weight:600}
+    .muted{color:var(--muted);font-size:13px}
+
+    .status {display:flex;align-items:center;gap:10px}
+    .dot{width:12px;height:12px;border-radius:50%;background:#ef4444;box-shadow:0 0 8px rgba(239,68,68,0.35)}
+    .dot.online{background:var(--accent);box-shadow:0 0 10px rgba(16,185,129,0.25)}
+
+    .info-row{display:flex;justify-content:space-between;padding:8px 0;border-top:1px dashed rgba(255,255,255,0.02)}
+    .players{font-size:14px}
+
+    .news-list{display:flex;flex-direction:column;gap:8px}
+    .news-item{background:rgba(255,255,255,0.02);padding:8px;border-radius:8px}
+
+    footer{margin-top:18px;color:var(--muted);font-size:13px;text-align:center}
+
+    /* small utilities */
+    .row{display:flex;gap:8px;align-items:center}
+    .copy-btn{background:transparent;border:1px solid rgba(255,255,255,0.04);padding:8px;border-radius:8px;color:var(--muted);cursor:pointer}
+
+    .players-list{display:flex;flex-wrap:wrap;gap:8px}
+    .player{background:rgba(255,255,255,0.02);padding:6px 8px;border-radius:999px;font-size:13px}
+
+    .badge{display:inline-block;padding:4px 8px;border-radius:999px;background:rgba(255,255,255,0.03);font-weight:600}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div class="logo" aria-hidden>
+        <!-- simple pickaxe icon -->
+        <svg width="36" height="36" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M2 20l6-6" stroke="#9dd4c5" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M4.5 10.5l9-9 4 4-9 9-4-4z" stroke="#9dd4c5" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </div>
+      <div class="title">
+        <h1>Minecraft サーバー情報</h1>
+        <p class="lead">サーバーの接続情報、ステータス、プレイヤー情報を一目で確認できます。</p>
+      </div>
+    </header>
+
+    <div class="grid">
+      <main>
+        <section class="card">
+          <h2>サーバーをチェック</h2>
+          <label for="serverIp">サーバーIP (例: play.example.com または 123.45.67.89:25565)</label>
+          <div style="display:flex;gap:8px;margin-bottom:10px">
+            <input id="serverIp" type="text" placeholder="サーバーIPを入力" value="play.example.com" />
+            <button id="checkBtn">チェック</button>
+          </div>
+          <div id="statusArea" class="card" style="padding:12px;background:transparent">
+            <div class="status">
+              <div id="statusDot" class="dot" title="ステータス"></div>
+              <div>
+                <div id="statusText">ステータス: —</div>
+                <div class="muted" id="versionText">バージョン: —</div>
+              </div>
+            </div>
+
+            <div style="margin-top:12px">
+              <div class="info-row"><div class="muted">プレイヤー</div><div id="playersCount" class="players">— / —</div></div>
+              <div class="info-row"><div class="muted">モッド / プラグイン</div><div id="modsInfo" class="muted">—</div></div>
+              <div class="info-row"><div class="muted">ホワイトリスト</div><div id="whitelistInfo" class="muted">—</div></div>
+            </div>
+
+            <div style="margin-top:12px">
+              <div class="muted">接続コマンド</div>
+              <div style="display:flex;gap:8px;margin-top:6px">
+                <input id="connectCmd" type="text" readonly style="flex:1;padding:8px;border-radius:8px;border:1px solid rgba(255,255,255,0.03);background:transparent;color:inherit" />
+                <button class="copy-btn" id="copyBtn">コピー</button>
+              </div>
+            </div>
+
+            <div style="margin-top:12px">
+              <div class="muted">現在のオンラインプレイヤー</div>
+              <div id="playersList" class="players-list" style="margin-top:8px">—</div>
+            </div>
+
+          </div>
+        </section>
+
+        <section class="card" style="margin-top:12px">
+          <h2>サーバーからのお知らせ</h2>
+          <div class="news-list" id="newsList">
+            <div class="news-item"><strong>2025-09-01</strong>：サーバーアップデートで新ワールドを追加しました！</div>
+            <div class="news-item"><strong>2025-08-10</strong>：建築イベント開催 — 優勝者に特製バッジ。</div>
+          </div>
+        </section>
+
+        <section class="card" style="margin-top:12px">
+          <h2>ルール</h2>
+          <ol class="muted">
+            <li>荒らし行為、ハラスメントは禁止。</li>
+            <li>チートや改造クライアントの使用禁止（サーバー側で検知した場合BAN）。</li>
+            <li>建築は他人の建物を破壊しないこと。許可が必要。</li>
+          </ol>
+        </section>
+
+      </main>
+
+      <aside>
+        <div class="card">
+          <h2>基本情報</h2>
+          <div class="muted">サーバー名</div>
+          <div style="font-weight:700;font-size:16px;margin:6px 0">サンプルサーバー</div>
+          <div class="muted">IP</div>
+          <div id="ipDisplay" style="font-weight:600;margin:6px 0">play.example.com</div>
+          <div class="muted">タイプ</div>
+          <div style="margin:6px 0"><span class="badge">Survival</span> <span class="badge">PvE</span></div>
+
+          <hr style="border:none;height:1px;background:rgba(255,255,255,0.02);margin:12px 0" />
+          <div class="muted">管理者</div>
+          <div style="font-weight:700;margin:6px 0">AdminName</div>
+          <div class="muted" style="font-size:13px">Discord: Admin#1234</div>
+
+          <div style="margin-top:12px">
+            <button id="discordBtn">Discord へ移動</button>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:12px">
+          <h2>サーバーマップ</h2>
+          <div style="width:100%;height:160px;background:linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));display:flex;align-items:center;justify-content:center;border-radius:8px">マップ画像をここに</div>
+        </div>
+
+        <div class="card" style="margin-top:12px">
+          <h2>接続ガイド</h2>
+          <ol class="muted">
+            <li>ゲームを起動 → マルチプレイ → 直接接続</li>
+            <li>IP を入力して接続</li>
+            <li>問題がある場合は管理者へ連絡</li>
+          </ol>
+        </div>
+
+      </aside>
+    </div>
+
+    <footer>
+      このサイトはデモです。編集してご利用ください。
+    </footer>
+  </div>
+
+  <script>
+    const checkBtn = document.getElementById('checkBtn');
+    const serverIpInput = document.getElementById('serverIp');
+    const statusDot = document.getElementById('statusDot');
+    const statusText = document.getElementById('statusText');
+    const versionText = document.getElementById('versionText');
+    const playersCount = document.getElementById('playersCount');
+    const playersList = document.getElementById('playersList');
+    const modsInfo = document.getElementById('modsInfo');
+    const whitelistInfo = document.getElementById('whitelistInfo');
+    const connectCmd = document.getElementById('connectCmd');
+    const copyBtn = document.getElementById('copyBtn');
+    const ipDisplay = document.getElementById('ipDisplay');
+    const newsList = document.getElementById('newsList');
+
+    function setOffline(){
+      statusDot.classList.remove('online');
+      statusText.textContent = 'ステータス: オフラインまたは応答なし';
+      versionText.textContent = 'バージョン: —';
+      playersCount.textContent = '— / —';
+      playersList.innerHTML = '—';
+      modsInfo.textContent = '—';
+      whitelistInfo.textContent = '—';
+      connectCmd.value = '';
+    }
+
+    async function checkServer(ip){
+      // mcsrvstat の公開APIを使う (CORSポリシーに注意)
+      // API: https://api.mcsrvstat.us/2/<ip>
+      try{
+        statusText.textContent = 'ステータス: 読み込み中...';
+        const apiUrl = 'https://api.mcsrvstat.us/2/' + encodeURIComponent(ip);
+        const res = await fetch(apiUrl);
+        if(!res.ok){ throw new Error('APIエラー'); }
+        const data = await res.json();
+        ipDisplay.textContent = ip;
+        connectCmd.value = ip;
+
+        if(data && data.online){
+          statusDot.classList.add('online');
+          statusText.textContent = 'ステータス: オンライン';
+          versionText.textContent = 'バージョン: ' + (data.version || '不明');
+          playersCount.textContent = (data.players && data.players.online !== undefined ? data.players.online : '—') + ' / ' + (data.players && data.players.max !== undefined ? data.players.max : '—');
+
+          // プレイヤーリスト
+          if(data.players && Array.isArray(data.players.list) && data.players.list.length>0){
+            playersList.innerHTML = '';
+            data.players.list.forEach(p=>{
+              const span = document.createElement('span'); span.className='player'; span.textContent = p; playersList.appendChild(span);
+            });
+          } else {
+            playersList.innerHTML = '<span class="muted">オンラインプレイヤーなし</span>';
+          }
+
+          // mods or plugins
+          if(data.modinfo && data.modinfo.type){
+            modsInfo.textContent = data.modinfo.type + (data.modinfo.mods ? (' — ' + (data.modinfo.mods.names || []).slice(0,5).join(', ')) : '');
+          } else if(data.software){
+            modsInfo.textContent = data.software;
+          } else {
+            modsInfo.textContent = '検出なし';
+          }
+
+          whitelistInfo.textContent = data.whitelisted ? '有効' : '無効';
+
+        } else {
+          setOffline();
+        }
+      } catch(err){
+        console.error(err);
+        setOffline();
+      }
+    }
+
+    checkBtn.addEventListener('click', ()=>{
+      const ip = serverIpInput.value.trim();
+      if(!ip){ alert('IPを入力してください'); return; }
+      checkServer(ip);
+    });
+
+    copyBtn.addEventListener('click', ()=>{
+      if(!connectCmd.value){ return; }
+      navigator.clipboard.writeText(connectCmd.value).then(()=>{
+        copyBtn.textContent = 'コピー完了';
+        setTimeout(()=>{ copyBtn.textContent = 'コピー'; }, 1500);
+      });
+    });
+
+    // 初期チェック
+    document.addEventListener('DOMContentLoaded', ()=>{
+      const defaultIp = serverIpInput.value.trim();
+      if(defaultIp) checkServer(defaultIp);
+
+      // お知らせの簡易追加例: 管理画面やCMSと連携してここを差し替える
+      // newsList.innerHTML = '<div class="news-item">...dynamic...</div>';
+    });
+  </script>
+</body>
+</html>
