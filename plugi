@@ -1,0 +1,844 @@
+<?php
+/*
+Plugin Name:wp-kkyoadmkit
+Plugin URI:https://wp-kkyoadmkit.42web.io/
+Description: 簡単に管理画面ログインのWordpressのロゴとja.wordpress.orgのURLを簡単に変更 IPブロック Search Console認証既読機能など 不正なログインを一時間ブロックなど
+Version: 2.1.0
+Author: honkitamc
+Author URL: https://www.youtube.com/@Urayakkyo
+Text Domain: wab-pro-single
+Text Domain: ja
+*/
+
+if ( ! defined( 'ABSPATH' ) ) exit;
+
+/**
+ * Single-file plugin implementing requested features:
+ * - Login logo replacement + link
+ * - IP block (single IP/CIDR)
+ * - Admin top-level settings page "サイトカスタマイズ"
+ * - Google Fonts choice (DotGothic16, Mochiy Pop P One, Press Start 2P, Yomogi)
+ * - SEO tags + OGP image support (basic) + Google Search Console meta insertion
+ * - "Read" feature with multiple templates (5) and form builder (visual/html)
+ * - Login failure limit (configurable) -> Block IP for 1 hour
+ * - All in one PHP file; inlined admin JS/CSS
+ *
+ * Note: This is a practical single-file implementation for admin-managed sites.
+ */
+
+class WAB_Pro_Singlefile {
+
+	const OPT_KEY = 'wab_pro_options_v21';
+	const SUBMISSIONS_KEY = 'wab_pro_form_submissions';
+	const FAILED_STORE_KEY = 'wab_pro_failed_ips'; // option for tracking failures
+	const BLOCKED_STORE_KEY = 'wab_pro_blocked_ips'; // blocked ips with expiry
+
+	private $defaults = array(
+		// branding
+		'logo_attachment_id' => '',
+		'logo_url' => '',
+		'logo_link' => 'https://ja.wordpress.org/',
+
+		// ip block
+		'ip_block_list' => '',
+
+		// fonts
+		'font_choice' => '',
+
+		// seo / ogp
+		'seo_description' => '',
+		'seo_robots' => '',
+		'og_image' => '',
+
+		// search console
+		'gsc_meta_content' => '',
+
+		// login failure
+		'login_fail_limit' => 3, // default
+		'login_block_duration' => 3600, // seconds (1 hour fixed)
+
+		// form & read
+		'form_mode' => 'visual',
+		'form_content_visual' => '',
+		'form_content_html' => '',
+		'form_mark_post_id' => '',
+		'read_template' => 'classic', // default template
+	);
+
+	public function __construct() {
+		// admin menu
+		add_action( 'admin_menu', array( $this, 'add_admin_menu' ) );
+		add_action( 'admin_init', array( $this, 'register_settings' ) );
+		add_action( 'admin_enqueue_scripts', array( $this, 'maybe_enqueue_admin' ) );
+
+		// login logo & link
+		add_action( 'login_enqueue_scripts', array( $this, 'login_custom_css' ) );
+		add_filter( 'login_headerurl', array( $this, 'login_header_url' ) );
+		add_filter( 'login_headertext', array( $this, 'login_header_text' ) );
+
+		// head: fonts, seo, gsc, og
+		add_action( 'wp_head', array( $this, 'output_font_and_seo' ), 1 );
+
+		// ip block check early
+		add_action( 'init', array( $this, 'maybe_block_by_ip' ), 1 );
+
+		// login failure hooks
+		add_action( 'wp_login_failed', array( $this, 'on_wp_login_failed' ) );
+		add_action( 'wp_login', array( $this, 'on_wp_login_success' ), 10, 2 );
+
+		// form handling
+		add_action( 'init', array( $this, 'handle_form_submission' ), 20 );
+		add_shortcode( 'wab_custom_form', array( $this, 'shortcode_custom_form' ) );
+		add_shortcode( 'wab_mark_read', array( $this, 'shortcode_mark_read_button' ) );
+	}
+
+	/* ---------------- Options ---------------- */
+
+	private function get_options() {
+		$opts = get_option( self::OPT_KEY, array() );
+		return wp_parse_args( $opts, $this->defaults );
+	}
+
+	public function register_settings() {
+		register_setting( 'wab_pro_group', self::OPT_KEY, array( $this, 'sanitize_options' ) );
+	}
+
+	public function sanitize_options( $input ) {
+		$out = $this->get_options();
+
+		$out['logo_attachment_id'] = isset( $input['logo_attachment_id'] ) ? intval( $input['logo_attachment_id'] ) : '';
+		$out['logo_url'] = isset( $input['logo_url'] ) ? esc_url_raw( $input['logo_url'] ) : '';
+		$out['logo_link'] = isset( $input['logo_link'] ) ? esc_url_raw( $input['logo_link'] ) : $this->defaults['logo_link'];
+
+		$out['ip_block_list'] = isset( $input['ip_block_list'] ) ? $this->sanitize_ip_list( $input['ip_block_list'] ) : '';
+
+		$allowed_fonts = array( '', 'dotgothic16', 'mochiy', 'pressstart2p', 'yomogi' );
+		$out['font_choice'] = in_array( $input['font_choice'] ?? '', $allowed_fonts, true ) ? $input['font_choice'] : '';
+
+		$out['seo_description'] = isset( $input['seo_description'] ) ? sanitize_text_field( $input['seo_description'] ) : '';
+		$out['seo_robots'] = isset( $input['seo_robots'] ) ? sanitize_text_field( $input['seo_robots'] ) : '';
+		$out['og_image'] = isset( $input['og_image'] ) ? esc_url_raw( $input['og_image'] ) : '';
+
+		$out['gsc_meta_content'] = isset( $input['gsc_meta_content'] ) ? sanitize_text_field( $input['gsc_meta_content'] ) : '';
+
+		$limit = isset( $input['login_fail_limit'] ) ? intval( $input['login_fail_limit'] ) : $this->defaults['login_fail_limit'];
+		if ( $limit < 1 ) $limit = 1;
+		if ( $limit > 50 ) $limit = 50;
+		$out['login_fail_limit'] = $limit;
+		$out['login_block_duration'] = intval( $this->defaults['login_block_duration'] );
+
+		$out['form_mode'] = ( isset( $input['form_mode'] ) && $input['form_mode'] === 'html' ) ? 'html' : 'visual';
+
+		if ( $out['form_mode'] === 'visual' ) {
+			$out['form_content_visual'] = isset( $input['form_content_visual'] ) ? wp_kses_post( $input['form_content_visual'] ) : '';
+		} else {
+			$html = isset( $input['form_content_html'] ) ? $input['form_content_html'] : '';
+			$html = preg_replace( '#<script.*?>.*?</script>#is', '', $html );
+			$out['form_content_html'] = $html;
+		}
+		$out['form_mark_post_id'] = isset( $input['form_mark_post_id'] ) ? intval( $input['form_mark_post_id'] ) : '';
+
+		$templates = array( 'classic','modern','pastel','minimal','retro' );
+		$out['read_template'] = in_array( $input['read_template'] ?? '', $templates, true ) ? $input['read_template'] : 'classic';
+
+		return $out;
+	}
+
+	/* ---------------- Admin UI ---------------- */
+
+	public function add_admin_menu() {
+		add_menu_page(
+			'サイトカスタマイズ',
+			'サイトカスタマイズ',
+			'manage_options',
+			'wab_pro_singlefile',
+			array( $this, 'settings_page_html' ),
+			'dashicons-admin-customizer',
+			61
+		);
+	}
+
+	public function maybe_enqueue_admin( $hook ) {
+		if ( $hook !== 'toplevel_page_wab_pro_singlefile' ) return;
+		wp_enqueue_media();
+		add_action( 'admin_print_footer_scripts', array( $this, 'admin_inline_scripts' ) );
+		add_action( 'admin_head', array( $this, 'admin_inline_styles' ) );
+	}
+
+	public function admin_inline_styles() {
+		?>
+		<style>
+			.wab-logo-preview { max-width:160px; max-height:160px; display:block; margin-bottom:6px; }
+			.wab-field { margin-bottom:20px; }
+			.wab-label { font-weight:600; display:block; margin-bottom:6px; }
+			.wab-template-preview { display:inline-block; width:140px; height:70px; border:1px solid #ddd; margin-right:8px; margin-bottom:8px; padding:6px; vertical-align:top; font-size:12px; overflow:hidden; }
+		</style>
+		<?php
+	}
+
+	public function admin_inline_scripts() {
+		$opts = $this->get_options();
+		$button_text = esc_js( __( '選択', 'wab-pro-single' ) );
+		?>
+		<script>
+		(function($){
+			var frame;
+			$('#wab-upload-btn').on('click', function(e){
+				e.preventDefault();
+				if ( frame ) { frame.open(); return; }
+				frame = wp.media({
+					title: '画像を選択',
+					button: { text: '<?php echo $button_text; ?>' },
+					multiple: false
+				});
+				frame.on('select', function(){
+					var attachment = frame.state().get('selection').first().toJSON();
+					$('#wab_logo_attachment_id').val(attachment.id);
+					$('#wab_logo_url').val(attachment.url);
+					$('#wab-logo-preview').attr('src', attachment.url).show();
+				});
+				frame.open();
+			});
+			$('#wab-remove-btn').on('click', function(e){
+				e.preventDefault();
+				$('#wab_logo_attachment_id').val('');
+				$('#wab_logo_url').val('');
+				$('#wab-logo-preview').hide().attr('src','');
+			});
+
+			$('input[name="<?php echo self::OPT_KEY; ?>[form_mode]"]').on('change', function(){
+				var mode = $(this).val();
+				if ( mode === 'visual' ) {
+					$('#wab-visual-editor-wrap').show();
+					$('#wab-html-editor-wrap').hide();
+				} else {
+					$('#wab-visual-editor-wrap').hide();
+					$('#wab-html-editor-wrap').show();
+				}
+			});
+
+		})(jQuery);
+		</script>
+		<?php
+	}
+
+	public function settings_page_html() {
+		if ( ! current_user_can( 'manage_options' ) ) wp_die( '権限がありません。' );
+		$opts = $this->get_options();
+		$fonts = array(
+			'' => '（デフォルトテーマフォント）',
+			'dotgothic16' => 'DotGothic16',
+			'mochiy' => 'Mochiy Pop P One',
+			'pressstart2p' => 'Press Start 2P',
+			'yomogi' => 'Yomogi'
+		);
+		$templates = array(
+			'classic' => 'Classic（標準）',
+			'modern' => 'Modern Card',
+			'pastel' => 'Soft Pastel',
+			'minimal' => 'Minimal Line',
+			'retro' => 'Pixel Retro'
+		);
+		?>
+		<div class="wrap">
+			<h1>サイトカスタマイズ</h1>
+			<form method="post" action="options.php">
+				<?php settings_fields( 'wab_pro_group' ); ?>
+				<?php do_settings_sections( 'wab_pro_group' ); ?>
+
+				<h2>ブランド（ログイン画面）</h2>
+				<div class="wab-field">
+					<img id="wab-logo-preview" class="wab-logo-preview" src="<?php echo esc_attr( $opts['logo_url'] ); ?>" style="<?php echo $opts['logo_url'] ? '' : 'display:none;'; ?>">
+					<input type="hidden" id="wab_logo_attachment_id" name="<?php echo self::OPT_KEY; ?>[logo_attachment_id]" value="<?php echo esc_attr( $opts['logo_attachment_id'] ); ?>">
+					<input type="text" id="wab_logo_url" name="<?php echo self::OPT_KEY; ?>[logo_url]" value="<?php echo esc_attr( $opts['logo_url'] ); ?>" style="width:60%;" placeholder="(自動入力/または直接URL入力可)">
+					<br>
+					<button class="button" id="wab-upload-btn">メディアライブラリから選択</button>
+					<button class="button" id="wab-remove-btn" type="button">解除</button>
+					<p class="description">ログイン画面のWordPressロゴを差し替えます。</p>
+				</div>
+
+				<div class="wab-field">
+					<label class="wab-label">ログインロゴのリンク先URL</label>
+					<input type="url" name="<?php echo self::OPT_KEY; ?>[logo_link]" value="<?php echo esc_attr( $opts['logo_link'] ); ?>" style="width:60%;">
+				</div>
+
+				<h2>セキュリティ</h2>
+				<div class="wab-field">
+					<label class="wab-label">IP ブロックリスト</label>
+					<textarea name="<?php echo self::OPT_KEY; ?>[ip_block_list]" rows="6" cols="80" placeholder="1行に1つ、またはカンマ区切りで IP/CIDR を指定"><?php echo esc_textarea( $opts['ip_block_list'] ); ?></textarea>
+					<p class="description">例: <code>203.0.113.45, 198.51.100.0/24</code></p>
+				</div>
+
+				<div class="wab-field">
+					<label class="wab-label">ログイン失敗回数制限（指定回数失敗で1時間ブロック）</label>
+					<input type="number" name="<?php echo self::OPT_KEY; ?>[login_fail_limit]" value="<?php echo esc_attr( $opts['login_fail_limit'] ); ?>" min="1" max="50" style="width:100px;">
+					<p class="description">例: 3（デフォルト）。指定回数を超えると、そのIPを1時間ブロックします。</p>
+				</div>
+
+				<h2>デザイン / フォント</h2>
+				<div class="wab-field">
+					<label class="wab-label">サイトタイトル用フォント（Google Fonts）</label>
+					<select name="<?php echo self::OPT_KEY; ?>[font_choice]">
+						<?php foreach ( $fonts as $k => $label ): ?>
+							<option value="<?php echo esc_attr($k); ?>" <?php selected( $opts['font_choice'], $k ); ?>><?php echo esc_html( $label ); ?></option>
+						<?php endforeach; ?>
+					</select>
+					<p class="description">選択したフォントは <code>.site-title</code> 等に適用します。テーマに応じて CSS を調整してください。</p>
+				</div>
+
+				<h2>SEO / Search Console</h2>
+				<div class="wab-field">
+					<label class="wab-label">Meta Description</label>
+					<input type="text" name="<?php echo self::OPT_KEY; ?>[seo_description]" value="<?php echo esc_attr( $opts['seo_description'] ); ?>" style="width:60%;">
+				</div>
+				<div class="wab-field">
+					<label class="wab-label">Meta Robots</label>
+					<input type="text" name="<?php echo self::OPT_KEY; ?>[seo_robots]" value="<?php echo esc_attr( $opts['seo_robots'] ); ?>" style="width:40%;" placeholder="index,follow">
+				</div>
+				<div class="wab-field">
+					<label class="wab-label">OGP 画像 URL</label>
+					<input type="text" name="<?php echo self::OPT_KEY; ?>[og_image]" value="<?php echo esc_attr( $opts['og_image'] ); ?>" style="width:60%;" placeholder="例: https://example.com/ogp.jpg">
+				</div>
+				<div class="wab-field">
+					<label class="wab-label">Google Search Console 認証コード（meta content 値）</label>
+					<input type="text" name="<?php echo self::OPT_KEY; ?>[gsc_meta_content]" value="<?php echo esc_attr( $opts['gsc_meta_content'] ); ?>" style="width:60%;" placeholder="例: XXXXXXXXXXXXX">
+					<p class="description">ここに値を入れると &lt;meta name="google-site-verification" content="..."&gt; が自動出力されます。</p>
+				</div>
+
+				<h2>既読（Read） / フォームビルダー</h2>
+				<div class="wab-field">
+					<label class="wab-label">既読テンプレート選択</label>
+					<select name="<?php echo self::OPT_KEY; ?>[read_template]">
+						<?php foreach ( $templates as $k => $label ): ?>
+							<option value="<?php echo esc_attr($k); ?>" <?php selected( $opts['read_template'], $k ); ?>><?php echo esc_html( $label ); ?></option>
+						<?php endforeach; ?>
+					</select>
+					<p class="description">既読ボタンのデザインを選択できます。プレビューは下に表示されます。</p>
+
+					<div style="margin-top:10px;">
+						<?php foreach ( $templates as $k => $label ): ?>
+							<div class="wab-template-preview">
+								<strong><?php echo esc_html( $label ); ?></strong>
+								<div style="margin-top:6px;">
+									<?php echo $this->render_read_template_preview_html( $k ); ?>
+								</div>
+							</div>
+						<?php endforeach; ?>
+					</div>
+				</div>
+
+				<div class="wab-field">
+					<label class="wab-label">フォーム編集モード</label>
+					<label><input type="radio" name="<?php echo self::OPT_KEY; ?>[form_mode]" value="visual" <?php checked( $opts['form_mode'], 'visual' ); ?>> ビジュアル (推奨)</label>
+					&nbsp;
+					<label><input type="radio" name="<?php echo self::OPT_KEY; ?>[form_mode]" value="html" <?php checked( $opts['form_mode'], 'html' ); ?>> HTML（生）</label>
+				</div>
+
+				<div id="wab-visual-editor-wrap" style="<?php echo $opts['form_mode'] === 'visual' ? '' : 'display:none;'; ?>">
+					<label class="wab-label">フォーム（ビジュアル編集）</label>
+					<?php
+					wp_editor( $opts['form_content_visual'], 'wab_form_visual_editor', array(
+						'textarea_name' => self::OPT_KEY . '[form_content_visual]',
+						'textarea_rows' => 8,
+					) );
+					?>
+				</div>
+
+				<div id="wab-html-editor-wrap" style="<?php echo $opts['form_mode'] === 'html' ? '' : 'display:none;'; ?>">
+					<label class="wab-label">フォーム（HTML）</label>
+					<textarea name="<?php echo self::OPT_KEY; ?>[form_content_html]" rows="8" cols="80"><?php echo esc_textarea( $opts['form_content_html'] ); ?></textarea>
+				</div>
+
+				<div class="wab-field">
+					<label class="wab-label">フォーム送信時に既読にする投稿ID（任意）</label>
+					<input type="text" name="<?php echo self::OPT_KEY; ?>[form_mark_post_id]" value="<?php echo esc_attr( $opts['form_mark_post_id'] ); ?>" style="width:20%;" placeholder="投稿ID">
+					<p class="description">ショートコード [wab_custom_form post_id="123"] のように属性で上書きできます。</p>
+				</div>
+
+				<?php submit_button(); ?>
+			</form>
+
+			<hr>
+			<h2>ショートコード</h2>
+			<ul>
+				<li><code>[wab_custom_form]</code> — 管理画面で作成したフォームを表示します。属性 <code>post_id</code> を与えると送信でその投稿を既読にします。</li>
+				<li><code>[wab_mark_read post_id="123"]</code> — 投稿IDを既読にする小さなボタンを表示します。</li>
+			</ul>
+
+		</div>
+		<?php
+	}
+
+	/* ---------------- Login logo ---------------- */
+
+	public function login_custom_css() {
+		$opts = $this->get_options();
+		$logo_url = $opts['logo_url'];
+		if ( ! $logo_url && $opts['logo_attachment_id'] ) {
+			$src = wp_get_attachment_image_url( $opts['logo_attachment_id'], 'full' );
+			if ( $src ) $logo_url = $src;
+		}
+		$logo_url = $logo_url ? esc_url( $logo_url ) : '';
+		if ( $logo_url ) {
+			echo '<style type="text/css">
+				.login h1 a { background-image: url("' . esc_url( $logo_url ) . '") !important; background-size: contain !important; width:300px !important; height:80px !important; }
+			</style>';
+		}
+	}
+
+	public function login_header_url( $url ) {
+		$opts = $this->get_options();
+		return esc_url( $opts['logo_link'] );
+	}
+
+	public function login_header_text( $text ) {
+		return __( 'Go to site', 'wab-pro-single' );
+	}
+
+	/* ---------------- IP Block ---------------- */
+
+	public function maybe_block_by_ip() {
+		// First, cleanup expired blocks
+		$this->cleanup_blocked_ips();
+
+		$opts = $this->get_options();
+		$list_raw = trim( $opts['ip_block_list'] );
+		$remote = $this->get_remote_ip();
+		if ( ! $remote ) return;
+
+		// check explicit blocked store (login-fail or manual)
+		$blocked = get_option( self::BLOCKED_STORE_KEY, array() );
+		if ( isset( $blocked[ $remote ] ) ) {
+			$expires = intval( $blocked[ $remote ] );
+			if ( time() < $expires ) {
+				$this->deny_access( 'このIPは一時的にブロックされています。' );
+			} else {
+				// expired
+				unset( $blocked[ $remote ] );
+				update_option( self::BLOCKED_STORE_KEY, $blocked );
+			}
+		}
+
+		// check configured IP block list
+		if ( empty( $list_raw ) ) return;
+		$list = $this->parse_ip_list( $list_raw );
+		foreach ( $list as $item ) {
+			if ( $item['type'] === 'cidr' ) {
+				if ( $this->ip_in_cidr( $remote, $item['value'] ) ) $this->deny_access();
+			} else {
+				if ( $remote === $item['value'] ) $this->deny_access();
+			}
+		}
+	}
+
+	private function deny_access( $msg = 'アクセスをブロックしました（IP ブロック）お使いのIPが管理者によりリストに入れられています' ) {
+		status_header( 403 );
+		wp_die( esc_html( $msg ), '403 Forbidden', array( 'response' => 403 ) );
+	}
+
+	private function get_remote_ip() {
+		$headers = array( 'HTTP_CLIENT_IP', 'HTTP_X_FORWARDED_FOR', 'HTTP_X_REAL_IP', 'REMOTE_ADDR' );
+		foreach ( $headers as $h ) {
+			if ( ! empty( $_SERVER[ $h ] ) ) {
+				$val = $_SERVER[ $h ];
+				if ( strpos( $val, ',' ) !== false ) {
+					$parts = explode( ',', $val );
+					$ip = trim( $parts[0] );
+				} else {
+					$ip = trim( $val );
+				}
+				if ( filter_var( $ip, FILTER_VALIDATE_IP ) ) return $ip;
+			}
+		}
+		return false;
+	}
+
+	private function sanitize_ip_list( $input ) {
+		$items = preg_split( '/[\r\n,]+/', $input );
+		$out = array();
+		foreach ( $items as $it ) {
+			$it = trim( $it );
+			if ( $it === '' ) continue;
+			if ( strpos( $it, '/' ) !== false ) {
+				list( $net, $mask ) = explode( '/', $it, 2 );
+				if ( filter_var( $net, FILTER_VALIDATE_IP ) && is_numeric( $mask ) ) $out[] = $it;
+			} else {
+				if ( filter_var( $it, FILTER_VALIDATE_IP ) ) $out[] = $it;
+			}
+		}
+		return implode( "\n", $out );
+	}
+
+	private function parse_ip_list( $raw ) {
+		$items = preg_split( '/[\r\n,]+/', $raw );
+		$res = array();
+		foreach ( $items as $it ) {
+			$it = trim( $it );
+			if ( $it === '' ) continue;
+			if ( strpos( $it, '/' ) !== false ) $res[] = array( 'type' => 'cidr', 'value' => $it );
+			else $res[] = array( 'type' => 'ip', 'value' => $it );
+		}
+		return $res;
+	}
+
+	private function ip_in_cidr( $ip, $cidr ) {
+		if ( strpos( $cidr, '/' ) === false ) return false;
+		list( $net, $mask ) = explode( '/', $cidr, 2 );
+		if ( filter_var( $ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4 ) && filter_var( $net, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4 ) ) {
+			$ip_long = ip2long( $ip );
+			$net_long = ip2long( $net );
+			$mask = intval( $mask );
+			$mask_long = -1 << (32 - $mask);
+			return ( ($ip_long & $mask_long) === ($net_long & $mask_long) );
+		}
+		// Note: IPv6 not supported in CIDR match here
+		return false;
+	}
+
+	/* ---------------- Login failure handling ---------------- */
+
+	public function on_wp_login_failed( $username ) {
+		$remote = $this->get_remote_ip();
+		if ( ! $remote ) return;
+
+		$opts = $this->get_options();
+		$limit = intval( $opts['login_fail_limit'] );
+		$duration = intval( $opts['login_block_duration'] ); // seconds
+
+		$failed = get_option( self::FAILED_STORE_KEY, array() );
+		$now = time();
+		if ( ! isset( $failed[ $remote ] ) ) {
+			$failed[ $remote ] = array( 'count' => 1, 'first' => $now, 'last' => $now );
+		} else {
+			$failed[ $remote ]['count'] += 1;
+			$failed[ $remote ]['last'] = $now;
+		}
+		update_option( self::FAILED_STORE_KEY, $failed );
+
+		// if exceeded limit, add to blocked store
+		if ( $failed[ $remote ]['count'] >= $limit ) {
+			$blocked = get_option( self::BLOCKED_STORE_KEY, array() );
+			$blocked[ $remote ] = $now + $duration; // block until timestamp
+			update_option( self::BLOCKED_STORE_KEY, $blocked );
+
+			// clear failed count to avoid re-block logic confusion
+			unset( $failed[ $remote ] );
+			update_option( self::FAILED_STORE_KEY, $failed );
+		}
+	}
+
+	public function on_wp_login_success( $user_login, $user ) {
+		// on successful login, clear failed attempts for this IP
+		$remote = $this->get_remote_ip();
+		if ( ! $remote ) return;
+		$failed = get_option( self::FAILED_STORE_KEY, array() );
+		if ( isset( $failed[ $remote ] ) ) {
+			unset( $failed[ $remote ] );
+			update_option( self::FAILED_STORE_KEY, $failed );
+		}
+		// Also ensure this IP is not blocked (if somehow exists)
+		$blocked = get_option( self::BLOCKED_STORE_KEY, array() );
+		if ( isset( $blocked[ $remote ] ) ) {
+			unset( $blocked[ $remote ] );
+			update_option( self::BLOCKED_STORE_KEY, $blocked );
+		}
+	}
+
+	private function cleanup_blocked_ips() {
+		$blocked = get_option( self::BLOCKED_STORE_KEY, array() );
+		$updated = false;
+		$now = time();
+		foreach ( $blocked as $ip => $expires ) {
+			if ( $now >= $expires ) {
+				unset( $blocked[ $ip ] );
+				$updated = true;
+			}
+		}
+		if ( $updated ) update_option( self::BLOCKED_STORE_KEY, $blocked );
+	}
+
+	/* ---------------- Fonts, SEO, GSC, OGP ---------------- */
+
+	public function output_font_and_seo() {
+		$opts = $this->get_options();
+
+		// Fonts map
+		$font_map = array(
+			'dotgothic16' => array( 'query' => 'DotGothic16' ),
+			'mochiy' => array( 'query' => 'Mochiy+Pop+P+One' ),
+			'pressstart2p' => array( 'query' => 'Press+Start+2P' ),
+			'yomogi' => array( 'query' => 'Yomogi' ),
+		);
+
+		$fc = $opts['font_choice'];
+		if ( $fc && isset( $font_map[ $fc ] ) ) {
+			$q = $font_map[ $fc ]['query'];
+			echo "<link rel=\"preconnect\" href=\"https://fonts.googleapis.com\">\n";
+			echo "<link rel=\"preconnect\" href=\"https://fonts.gstatic.com\" crossorigin>\n";
+			echo "<link href=\"https://fonts.googleapis.com/css2?family=" . esc_attr( $q ) . "&display=swap\" rel=\"stylesheet\">\n";
+			$family_css = str_replace( '+', ' ', $q );
+			echo "<style>.site-title, h1.site-title, .site-branding .site-title { font-family: '{$family_css}', sans-serif !important; }</style>\n";
+		}
+
+		// SEO meta
+		if ( $opts['seo_description'] ) {
+			echo '<meta name="description" content="' . esc_attr( $opts['seo_description'] ) . '">' . "\n";
+		}
+		if ( $opts['seo_robots'] ) {
+			echo '<meta name="robots" content="' . esc_attr( $opts['seo_robots'] ) . '">' . "\n";
+		}
+
+		// OGP basic (og:title, og:description, og:image)
+		if ( is_singular() ) {
+			$title = single_post_title( '', false );
+			$desc = get_the_excerpt() ?: $opts['seo_description'];
+			echo '<meta property="og:title" content="' . esc_attr( $title ) . '">' . "\n";
+			if ( $desc ) echo '<meta property="og:description" content="' . esc_attr( wp_strip_all_tags( $desc ) ) . '">' . "\n";
+			$og = '';
+			if ( has_post_thumbnail() ) {
+				$thumb = get_the_post_thumbnail_url( get_the_ID(), 'full' );
+				$og = $thumb;
+			} elseif ( $opts['og_image'] ) {
+				$og = $opts['og_image'];
+			}
+			if ( $og ) echo '<meta property="og:image" content="' . esc_url( $og ) . '">' . "\n";
+		} else {
+			// site-wide
+			if ( $opts['og_image'] ) echo '<meta property="og:image" content="' . esc_url( $opts['og_image'] ) . '">' . "\n";
+		}
+
+		// Google Search Console meta
+		if ( $opts['gsc_meta_content'] ) {
+			echo '<meta name="google-site-verification" content="' . esc_attr( $opts['gsc_meta_content'] ) . '">' . "\n";
+		}
+	}
+
+	/* ---------------- Form & Read feature ---------------- */
+
+	public function shortcode_custom_form( $atts ) {
+		$opts = $this->get_options();
+		$atts = shortcode_atts( array( 'post_id' => '' ), $atts, 'wab_custom_form' );
+		$post_id = intval( $atts['post_id'] ? $atts['post_id'] : $opts['form_mark_post_id'] );
+
+		$mode = $opts['form_mode'];
+		$form_html = '';
+		if ( $mode === 'visual' ) $form_html = $opts['form_content_visual'];
+		else $form_html = $opts['form_content_html'];
+
+		$has_form_tag = ( stripos( $form_html, '<form' ) !== false );
+		$nonce = wp_create_nonce( 'wab_pro_form_submit' );
+		ob_start();
+		echo '<div class="wab-pro-custom-form">';
+		if ( $has_form_tag ) {
+			$form_html = preg_replace( '/(<form[^>]*>)/i', '$1' . '<input type="hidden" name="wab_form_nonce" value="' . esc_attr( $nonce ) . '"><input type="hidden" name="wab_form_mark_post_id" value="' . esc_attr( $post_id ) . '">', $form_html, 1 );
+			echo $form_html;
+		} else {
+			echo '<form method="post">';
+			echo '<input type="hidden" name="wab_form_nonce" value="' . esc_attr( $nonce ) . '">';
+			echo '<input type="hidden" name="wab_form_mark_post_id" value="' . esc_attr( $post_id ) . '">';
+			echo $form_html;
+			echo '<p><button type="submit" name="wab_form_submit" class="button">送信</button></p>';
+			echo '</form>';
+		}
+		echo '</div>';
+		return ob_get_clean();
+	}
+
+	public function handle_form_submission() {
+		if ( empty( $_POST ) ) return;
+		if ( isset( $_POST['wab_form_submit'] ) || isset( $_POST['wab_form_nonce'] ) ) {
+			$nonce = isset( $_POST['wab_form_nonce'] ) ? sanitize_text_field( wp_unslash( $_POST['wab_form_nonce'] ) ) : '';
+			if ( ! wp_verify_nonce( $nonce, 'wab_pro_form_submit' ) ) return;
+
+			$post_id = isset( $_POST['wab_form_mark_post_id'] ) ? intval( $_POST['wab_form_mark_post_id'] ) : 0;
+			if ( isset( $_POST['post_id'] ) ) $post_id = intval( $_POST['post_id'] );
+
+			if ( $post_id ) $this->mark_post_as_read( $post_id );
+
+			$record = array(
+				'time' => current_time( 'mysql' ),
+				'post_id' => $post_id,
+				'data' => array()
+			);
+			foreach ( $_POST as $k => $v ) {
+				if ( in_array( $k, array( 'wab_form_nonce', 'wab_form_submit', 'wab_form_mark_post_id' ), true ) ) continue;
+				$record['data'][ sanitize_text_field( wp_unslash( $k ) ) ] = is_array( $v ) ? array_map( 'sanitize_text_field', $v ) : sanitize_text_field( wp_unslash( $v ) );
+			}
+			$existing = get_option( self::SUBMISSIONS_KEY, array() );
+			$existing[] = $record;
+			if ( count( $existing ) > 200 ) $existing = array_slice( $existing, -200 );
+			update_option( self::SUBMISSIONS_KEY, $existing );
+
+			wp_safe_redirect( wp_get_referer() ? wp_get_referer() : home_url() );
+			exit;
+		}
+	}
+
+	/* Read logic */
+
+	public function mark_post_as_read( $post_id ) {
+		if ( is_user_logged_in() ) {
+			$user_id = get_current_user_id();
+			$key = 'wab_pro_read_posts';
+			$reads = get_user_meta( $user_id, $key, true );
+			if ( ! is_array( $reads ) ) $reads = array();
+			if ( ! in_array( $post_id, $reads, true ) ) {
+				$reads[] = $post_id;
+				update_user_meta( $user_id, $key, $reads );
+			}
+		} else {
+			$cookie = isset( $_COOKIE['wab_pro_read_posts'] ) ? wp_unslash( $_COOKIE['wab_pro_read_posts'] ) : '';
+			$list = array();
+			if ( $cookie ) {
+				$decoded = json_decode( stripslashes( $cookie ), true );
+				if ( is_array( $decoded ) ) $list = $decoded;
+			}
+			if ( ! in_array( $post_id, $list, true ) ) {
+				$list[] = $post_id;
+				setcookie( 'wab_pro_read_posts', wp_json_encode( $list ), time() + 30*24*3600, COOKIEPATH ? COOKIEPATH : '/' );
+				$_COOKIE['wab_pro_read_posts'] = wp_json_encode( $list );
+			}
+		}
+	}
+
+	public function is_post_read( $post_id ) {
+		if ( is_user_logged_in() ) {
+			$reads = get_user_meta( get_current_user_id(), 'wab_pro_read_posts', true );
+			if ( ! is_array( $reads ) ) return false;
+			return in_array( $post_id, $reads, true );
+		} else {
+			$cookie = isset( $_COOKIE['wab_pro_read_posts'] ) ? wp_unslash( $_COOKIE['wab_pro_read_posts'] ) : '';
+			if ( $cookie ) {
+				$list = json_decode( stripslashes( $cookie ), true );
+				if ( is_array( $list ) && in_array( $post_id, $list, true ) ) return true;
+			}
+			return false;
+		}
+	}
+
+	// shortcode: mark-read button
+	public function shortcode_mark_read_button( $atts ) {
+		$atts = shortcode_atts( array( 'post_id' => get_the_ID() ), $atts, 'wab_mark_read' );
+		$post_id = intval( $atts['post_id'] );
+		if ( ! $post_id ) return '';
+
+		$is_read = $this->is_post_read( $post_id );
+		$template = $this->get_options()['read_template'];
+
+		return $this->render_read_button_html( $post_id, $is_read, $template );
+	}
+
+	/* ---------------- Read templates rendering ---------------- */
+
+	private function render_read_button_html( $post_id, $is_read, $template ) {
+		$nonce = wp_create_nonce( 'wab_pro_form_submit' );
+		$label = $is_read ? '既読 ✅' : '既読にする';
+		$read_count = $this->get_read_count( $post_id );
+
+		switch ( $template ) {
+			case 'modern':
+				ob_start();
+				?>
+				<div class="wab-read-modern" style="display:inline-block;padding:8px;border-radius:8px;box-shadow:0 1px 4px rgba(0,0,0,.08);">
+					<form method="post" style="display:inline">
+						<input type="hidden" name="wab_form_nonce" value="<?php echo esc_attr( $nonce ); ?>">
+						<input type="hidden" name="wab_form_mark_post_id" value="<?php echo esc_attr( $post_id ); ?>">
+						<button class="button" type="submit" <?php echo $is_read ? 'disabled' : ''; ?>><?php echo esc_html( $label ); ?></button>
+						<span style="margin-left:8px;color:#666;"><?php echo intval( $read_count ); ?> 人</span>
+					</form>
+				</div>
+				<?php
+				return ob_get_clean();
+
+			case 'pastel':
+				ob_start();
+				?>
+				<form method="post" style="display:inline-block;background:#fff6fb;padding:8px;border-radius:20px;">
+					<input type="hidden" name="wab_form_nonce" value="<?php echo esc_attr( $nonce ); ?>">
+					<input type="hidden" name="wab_form_mark_post_id" value="<?php echo esc_attr( $post_id ); ?>">
+					<button class="button" type="submit" <?php echo $is_read ? 'disabled' : ''; ?>><?php echo esc_html( $label ); ?></button>
+					<span style="margin-left:8px;color:#888;"><?php echo intval( $read_count ); ?></span>
+				</form>
+				<?php
+				return ob_get_clean();
+
+			case 'minimal':
+				ob_start();
+				?>
+				<form method="post" style="display:inline">
+					<input type="hidden" name="wab_form_nonce" value="<?php echo esc_attr( $nonce ); ?>">
+					<input type="hidden" name="wab_form_mark_post_id" value="<?php echo esc_attr( $post_id ); ?>">
+					<button type="submit" style="background:none;border:1px solid #ccc;padding:6px 10px;border-radius:4px;" <?php echo $is_read ? 'disabled' : ''; ?>><?php echo esc_html( $label ); ?></button>
+					<span style="margin-left:6px;color:#666;"><?php echo intval( $read_count ); ?></span>
+				</form>
+				<?php
+				return ob_get_clean();
+
+			case 'retro':
+				ob_start();
+				?>
+				<form method="post" style="display:inline;font-family: 'Press Start 2P', monospace; font-size:12px;">
+					<input type="hidden" name="wab_form_nonce" value="<?php echo esc_attr( $nonce ); ?>">
+					<input type="hidden" name="wab_form_mark_post_id" value="<?php echo esc_attr( $post_id ); ?>">
+					<button type="submit" style="padding:6px 8px;" <?php echo $is_read ? 'disabled' : ''; ?>><?php echo esc_html( $label ); ?></button>
+					<span style="margin-left:6px;"><?php echo intval( $read_count ); ?></span>
+				</form>
+				<?php
+				return ob_get_clean();
+
+			case 'classic':
+			default:
+				ob_start();
+				?>
+				<form method="post" style="display:inline">
+					<input type="hidden" name="wab_form_nonce" value="<?php echo esc_attr( $nonce ); ?>">
+					<input type="hidden" name="wab_form_mark_post_id" value="<?php echo esc_attr( $post_id ); ?>">
+					<button type="submit" class="button" <?php echo $is_read ? 'disabled' : ''; ?>><?php echo esc_html( $label ); ?></button>
+					<span style="margin-left:8px;color:#666;"><?php echo intval( $read_count ); ?></span>
+				</form>
+				<?php
+				return ob_get_clean();
+		}
+	}
+
+	private function render_read_template_preview_html( $template_key ) {
+		// small inline preview HTML for admin list
+		switch ( $template_key ) {
+			case 'modern':
+				return '<div style="background:#fff;padding:6px;border-radius:6px;box-shadow:0 1px 3px rgba(0,0,0,.06);font-size:11px;">既読にする <span style="margin-left:6px;color:#666;">12 人</span></div>';
+			case 'pastel':
+				return '<div style="background:#fff6fb;padding:6px;border-radius:999px;font-size:11px;">既読にする <span style="color:#888;margin-left:6px;">8</span></div>';
+			case 'minimal':
+				return '<div style="border:1px solid #ccc;padding:6px;border-radius:4px;font-size:11px;">既読にする</div>';
+			case 'retro':
+				return '<div style="font-family: monospace;font-size:11px;">[既読] 7</div>';
+			case 'classic':
+			default:
+				return '<div style="font-size:11px;">既読にする <span style="color:#666;margin-left:6px;">3</span></div>';
+		}
+	}
+
+	private function get_read_count( $post_id ) {
+		// approximate: count users + cookie occurrences (basic)
+		$count = 0;
+		// count users who have meta
+		$args = array( 'meta_key' => 'wab_pro_read_posts', 'meta_value' => $post_id );
+		// expensive to query; to keep simple we'll not run WP_User_Query for performance.
+		// Instead, we read submissions option for counts and user_meta not enumerated.
+		$sub = get_option( self::SUBMISSIONS_KEY, array() );
+		foreach ( $sub as $r ) {
+			if ( isset( $r['post_id'] ) && intval( $r['post_id'] ) === intval( $post_id ) ) $count++;
+		}
+		// This is an approximate count (admin can extend with proper logging)
+		return $count;
+	}
+
+	/* ---------------- Utilities ---------------- */
+
+	// For simplicity, avoid expensive scanning of users. Admin can request '既読ログ' feature later.
+
+	/* ---------------- Plugin bootstrap ---------------- */
+
+}
+
+new WAB_Pro_Singlefile();
